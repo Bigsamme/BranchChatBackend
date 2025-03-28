@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import jwt
 from pydantic import BaseModel
 from datetime import datetime
@@ -47,15 +48,17 @@ def get_authenticated_user(authorization: str = Header(...)) -> str:
 
 def title(text: str) -> str:
     """
-    Call the Gemini model to generate a short chat title from the user’s message.
+    Call the Gemini model to generate a short chat title from the user's message using a streaming response.
     """
     client = genai.Client(api_key=os.getenv("GENAI_API_KEY"))
-    response = client.models.generate_content(
+    response = client.models.generate_content_stream(
         model="gemini-2.0-flash",
-        contents=f"Can you make this into a short title for a chat: {text}\n"
-                 f"Return only the title text and nothing else.",
+        contents=[f"Can you make this into a short title for a chat: {text}\nReturn only the title text and nothing else."]
     )
-    return response.text.strip()
+    full_text = ""
+    for chunk in response:
+        full_text += chunk.text
+    return full_text.strip()
 
 def generate_ai_reply_with_context(chat_id: str, prompt: str) -> str:
     """
@@ -70,24 +73,27 @@ def generate_ai_reply_with_context(chat_id: str, prompt: str) -> str:
                        .execute()
     messages = msg_resp.data or []
 
-    # Build a “context” prompt from the existing messages
+    # Build a "context" prompt from the existing messages
     context_prompt = ""
     for message in messages:
         context_prompt += f"{message['role']}: {message['content']}\n"
 
-    # Append the new prompt as the user’s latest message
+    # Append the new prompt as the user's latest message
     # context_prompt += f"user: {prompt}\n"  # This line has been removed
 
     client = genai.Client(api_key=os.getenv("GENAI_API_KEY"))
     chat_obj = client.chats.create(model="gemini-2.0-flash")
-    response = chat_obj.send_message(context_prompt)
-    return response.text.strip()
+    stream_response = chat_obj.send_message_stream(context_prompt)
+    full_text = ""
+    for chunk in stream_response:
+        full_text += chunk.text
+    return full_text.strip()
 
 @app.post("/chats")
 def create_empty_chat(user_id: str = Depends(get_authenticated_user)):
     """
     Creates a new chat with a placeholder title, returns { chat_id, title }.
-    No AI calls here, so it’s fast.
+    No AI calls here, so it's fast.
     """
     placeholder_title = "Untitled Chat"
     data = {
@@ -135,10 +141,10 @@ def get_chat_messages(chat_id: str, user_id: str = Depends(get_authenticated_use
 def create_message(chat_id: str, req: MessageRequest, user_id: str = Depends(get_authenticated_user)):
     """
     1) Store the user's new message in the DB.
-    2) If the chat is still “Untitled Chat,” rename it using the user’s text.
+    2) If the chat is still "Untitled Chat," rename it using the user's text.
     3) Generate an AI reply with context, store it, and return both new messages.
     """
-    # 1. Insert the user’s message
+    # 1. Insert the user's message
     user_msg_data = {
         "chat_id": chat_id,
         "user_id": user_id,
@@ -150,7 +156,7 @@ def create_message(chat_id: str, req: MessageRequest, user_id: str = Depends(get
     if not user_insert.data:
         raise HTTPException(status_code=500, detail="Failed to insert user message")
 
-    # 2. Possibly rename the chat if it’s still a placeholder
+    # 2. Possibly rename the chat if it's still a placeholder
     chat_resp = supabase.table("chats").select("*").eq("id", chat_id).execute()
     if not chat_resp.data:
         raise HTTPException(status_code=404, detail="Chat not found")
@@ -159,23 +165,41 @@ def create_message(chat_id: str, req: MessageRequest, user_id: str = Depends(get
         new_title = title(req.content)
         supabase.table("chats").update({"title": new_title}).eq("id", chat_id).execute()
 
-    # 3. Generate the AI reply
-    ai_reply = generate_ai_reply_with_context(chat_id, req.content)
-    ai_msg_data = {
-        "chat_id": chat_id,
-        "user_id": user_id,  # or a special "assistant" user_id if you prefer
-        "role": "assistant",
-        "content": ai_reply,
-        "created_at": datetime.utcnow().isoformat()
-    }
-    ai_insert = supabase.table("messages").insert(ai_msg_data).execute()
-    if not ai_insert.data:
-        raise HTTPException(status_code=500, detail="Failed to insert AI message")
+    # 3. Stream the AI reply and store it after completion
+    def stream_response():
+        client = genai.Client(api_key=os.getenv("GENAI_API_KEY"))
+        chat_obj = client.chats.create(model="gemini-2.0-flash")
 
-    return {
-        "user_message": user_insert.data[0],
-        "assistant_message": ai_insert.data[0]
-    }
+        # Rebuild context from last 100 messages
+        msg_resp = supabase.table("messages") \
+                           .select("*") \
+                           .eq("chat_id", chat_id) \
+                           .order("created_at", desc=False) \
+                           .limit(100) \
+                           .execute()
+        messages = msg_resp.data or []
+        context_prompt = ""
+        for message in messages:
+            context_prompt += f"{message['role']}: {message['content']}\n"
+
+        stream = chat_obj.send_message_stream(context_prompt)
+
+        full_text = ""
+        for chunk in stream:
+            full_text += chunk.text
+            yield chunk.text
+
+        # Store assistant message after streaming is complete
+        ai_msg_data = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "role": "assistant",
+            "content": full_text,
+            "created_at": datetime.utcnow().isoformat()
+        }
+        supabase.table("messages").insert(ai_msg_data).execute()
+
+    return StreamingResponse(stream_response(), media_type="text/plain")
 
 class BranchCreateRequest(BaseModel):
     name: str
@@ -301,7 +325,7 @@ def create_branch_message(
 ):
     """
     1) Insert a user message into this branch,
-    2) Generate an AI reply (context from only this branch’s messages),
+    2) Generate an AI reply (context from only this branch's messages),
     3) Insert the AI reply,
     4) Return both new messages.
     """
@@ -359,3 +383,33 @@ def create_branch_message(
 @app.get("/test")
 def test(user_id: str = Depends(get_authenticated_user)):
     return {"user_id": user_id}
+
+@app.delete("/chats/{chat_id}")
+def delete_chat(chat_id: str, user_id: str = Depends(get_authenticated_user)):
+    """
+    Delete a chat and all its messages in the correct order to avoid foreign key errors.
+    """
+    # First verify the chat belongs to the user
+    chat_resp = supabase.table("chats").select("*").eq("id", chat_id).eq("user_id", user_id).execute()
+    if not chat_resp.data:
+        raise HTTPException(status_code=404, detail="Chat not found or unauthorized")
+
+    # Delete all branches of this chat first
+    branch_chats = supabase.table("chats").select("id").eq("branch_of", chat_id).execute()
+    if branch_chats.data:
+        for branch in branch_chats.data:
+            # Recursively delete each branch
+            delete_chat(branch["id"], user_id)
+
+    # Delete all branches referencing messages in this chat
+    supabase.table("branches").delete().eq("chat_id", chat_id).execute()
+
+    # Now delete all messages in the chat
+    supabase.table("messages").delete().eq("chat_id", chat_id).execute()
+
+    # Finally delete the chat itself
+    supabase.table("chats").delete().eq("id", chat_id).execute()
+
+    return {"status": "success"}
+
+#uvicorn main:app --reload
