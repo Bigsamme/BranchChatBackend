@@ -76,7 +76,7 @@ def generate_ai_reply_with_context(chat_id: str, prompt: str) -> str:
         context_prompt += f"{message['role']}: {message['content']}\n"
 
     # Append the new prompt as the user’s latest message
-    context_prompt += f"user: {prompt}\n"
+    # context_prompt += f"user: {prompt}\n"  # This line has been removed
 
     client = genai.Client(api_key=os.getenv("GENAI_API_KEY"))
     chat_obj = client.chats.create(model="gemini-2.0-flash")
@@ -331,8 +331,6 @@ def create_branch_message(
     for m in all_branch_msgs:
         context_prompt += f"{m['role']}: {m['content']}\n"
 
-    # Append the new user message
-    context_prompt += f"user: {req.content}\n"
 
     # 3. Generate the AI reply
     client = genai.Client(api_key=os.getenv("GENAI_API_KEY"))
