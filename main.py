@@ -2,14 +2,13 @@ from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import jwt
+import json
 from pydantic import BaseModel
 from datetime import datetime
 import os
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from google import genai
-from openai import OpenAI
-import anthropic
+from ai_providers import generate_title, generate_response, stream_response
 
 load_dotenv()
 
@@ -18,6 +17,7 @@ SUPABASE_API_KEY = os.getenv("SUPABASE_API_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_API_KEY)
 
 app = FastAPI()
+
 
 # Configure CORS
 origins = [
@@ -46,100 +46,6 @@ def get_authenticated_user(authorization: str = Header(...)) -> str:
         return user_id
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid authentication token")
-
-def title(text: str, provider: str = "gemini", model: str = "gemini-2.0-flash") -> str:
-    """
-    Generate a short chat title using the selected AI provider and model.
-    """
-    if provider.lower() == "gemini":
-        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        response = client.models.generate_content_stream(
-            model=model,
-            contents=[f"Can you make this into a short title for a chat: {text}\nReturn only the title text and nothing else."]
-        )
-        full_text = ""
-        for chunk in response:
-            full_text += chunk.text
-        return full_text.strip()
-    elif provider.lower() == "openai":
-        
-        client = OpenAI()
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": f"Can you make this into a short title for a chat: {text}\nReturn only the title text and nothing else."}],
-            stream=True
-        )
-        full_text = ""
-        for chunk in response:
-            if chunk.choices[0].delta.content:
-                content = chunk.choices[0].delta.content
-                full_text += content
-        return full_text.strip()
-    elif provider.lower() == "claude":
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        response = client.messages.create(
-            model=model,
-            max_tokens=256,
-            messages=[{"role": "user", "content": f"Can you make this into a short title for a chat: {text}\nReturn only the title text and nothing else."}],
-        )
-        return response.content.strip()
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported provider")
-
-def generate_ai_reply_with_context(chat_id: str, prompt: str, provider: str = "gemini", model: str = "gemini-2.0-flash") -> str:
-    """
-    Retrieve the last 100 messages for the chat, build a context prompt,
-    and generate an AI reply using the selected provider/model.
-    """
-    msg_resp = supabase.table("messages") \
-                       .select("*") \
-                       .eq("chat_id", chat_id) \
-                       .order("created_at", desc=False) \
-                       .limit(100) \
-                       .execute()
-    messages = msg_resp.data or []
-    context_prompt = ""
-    for message in messages:
-        context_prompt += f"{message['role']}: {message['content']}\n"
-    
-    if provider.lower() == "gemini":
-        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        chat_obj = client.chats.create(model=model)
-        stream_response = chat_obj.send_message_stream(context_prompt)
-        full_text = ""
-        for chunk in stream_response:
-            full_text += chunk.text
-        return full_text.strip()
-    elif provider.lower() == "openai":
-        
-        client = OpenAI()
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": context_prompt}],
-            stream=True
-        )
-        full_text = ""
-        for chunk in response:
-            if chunk.choices[0].delta.content:
-                content = chunk.choices[0].delta.content
-                full_text += content
-        return full_text.strip()
-    
-    elif provider.lower() == "claude":
-
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        full_text = ""
-        with client.messages.stream(
-            max_tokens=1024,
-            messages=[{"role": "user", "content": context_prompt}],
-            model=model,
-            stream=True
-        ) as stream:
-            for text in stream.text_stream:
-                full_text += text
-        return full_text.strip()
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported provider")
 
 @app.post("/chats")
 def create_empty_chat(user_id: str = Depends(get_authenticated_user)):
@@ -195,11 +101,6 @@ def create_message(
     model: str = "gemini-2.0-flash",
     user_id: str = Depends(get_authenticated_user)
 ):
-    """
-    1) Store the user's message.
-    2) If the chat is still "Untitled Chat," rename it using the selected AI.
-    3) Stream an AI reply using the selected provider/model, store it, and return the stream.
-    """
     # 1. Insert the user's message
     user_msg_data = {
         "chat_id": chat_id,
@@ -213,76 +114,23 @@ def create_message(
     if not user_insert.data:
         raise HTTPException(status_code=500, detail="Failed to insert user message")
     
-    # 2. Possibly rename the chat if it's still a placeholder
+    # 2. Possibly rename the chat if it's still a placeholder and deduct tokens for title generation
     chat_resp = supabase.table("chats").select("*").eq("id", chat_id).execute()
     if not chat_resp.data:
         raise HTTPException(status_code=404, detail="Chat not found")
     current_title = chat_resp.data[0]["title"]
     if current_title == "Untitled Chat":
-        new_title = title(req.content, provider, model)
+        new_title = generate_title(req.content, provider, model)
         supabase.table("chats").update({"title": new_title}).eq("id", chat_id).execute()
     
-    # 3. Stream the AI reply and store it after completion
-    def stream_response():
-        # Rebuild context from last 100 messages
-        msg_resp = supabase.table("messages") \
-                           .select("*") \
-                           .eq("chat_id", chat_id) \
-                           .order("created_at", desc=True) \
-                           .limit(100) \
-                           .execute()
-        messages_list = list(reversed(msg_resp.data or []))  # Reverse to get oldest to newest
-        context_prompt = ""
-        for message in messages_list:
-            context_prompt += f"{message['role']}: {message['content']}\n"
-        
-        full_text = ""
-        if provider.lower() == "gemini":
-            print("hello")
-            client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-            chat_obj = client.chats.create(model=model)
-            stream = chat_obj.send_message_stream(context_prompt)
-            for chunk in stream:
-                full_text += chunk.text
-                yield chunk.text
-        elif provider.lower() == "openai":
-            
-            client = OpenAI()
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": context_prompt}],
-                stream=True
-            )
-            for chunk in response:
-                if chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
-                    full_text += content
-                    yield content
-        elif provider.lower() == "claude":
-            client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-            with client.messages.stream(
-                max_tokens=1024,
-                messages=[{"role": "user", "content": context_prompt}],
-                model=model,
-            ) as stream:
-                for text in stream.text_stream:
-                    full_text += text
-                    yield text
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported provider")
-        
-        # Store the full assistant reply after streaming is complete
-        ai_msg_data = {
-            "chat_id": chat_id,
-            "user_id": user_id,
-            "role": "assistant",
-            "content": full_text,
-            "created_at": datetime.utcnow().isoformat(),
-            "model": model
-        }
-        supabase.table("messages").insert(ai_msg_data).execute()
-    
-    return StreamingResponse(stream_response(), media_type="text/plain")
+    # 3. Stream the AI reply, deduct tokens after streaming is complete, and return the stream
+    def stream_with_deduction():
+        full_reply = ""
+        for chunk in stream_response(supabase, chat_id, user_id, provider, model):
+            full_reply += chunk
+            yield chunk
+
+    return StreamingResponse(stream_with_deduction(), media_type="text/plain")
 
 class BranchCreateRequest(BaseModel):
     name: str
@@ -422,38 +270,15 @@ def create_branch_message(
                            .eq("chat_id", chat_id) \
                            .eq("branch_id", branch_id) \
                            .order("created_at", desc=False) \
-                           .limit(100) \
+                           .limit(10) \
                            .execute()
     all_branch_msgs = context_resp.data or []
     context_prompt = ""
     for m in all_branch_msgs:
         context_prompt += f"{m['role']}: {m['content']}\n"
 
-
-    if provider.lower() == "gemini":
-        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        chat_obj = client.chats.create(model=model)
-        ai_response = chat_obj.send_message(context_prompt)
-        ai_reply = ai_response.text.strip()
-    elif provider.lower() == "openai":
-        
-        client = OpenAI()
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": context_prompt}],
-        )
-        ai_reply = response.choices[0].message.content
-
-    elif provider.lower() == "claude":
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        response = client.messages.create(
-            model=model,
-            max_tokens=1024,
-            messages=[{"role": "user", "content": context_prompt}],
-        )
-        ai_reply = response.content.strip()
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported provider")
+    response = generate_response(context_prompt, provider, model)
+    ai_reply = response["content"]
     
     ai_msg_data = {
         "chat_id": chat_id,
@@ -467,6 +292,8 @@ def create_branch_message(
     ai_insert = supabase.table("messages").insert(ai_msg_data).execute()
     if not ai_insert.data:
         raise HTTPException(status_code=500, detail="Failed to insert AI message")
+    
+    # Estimate and deduct token cost
 
     return {
         "user_message": user_insert.data[0],
@@ -490,5 +317,35 @@ def delete_chat(chat_id: str, user_id: str = Depends(get_authenticated_user)):
     supabase.table("messages").delete().eq("chat_id", chat_id).execute()
     supabase.table("chats").delete().eq("id", chat_id).execute()
     return {"status": "success"}
+
+
+@app.post("/api/user")
+async def user(request: Request):
+    """Handles Clerk webhook when a user is created. Saves the user_id and sets token_count to 10000 in Supabase."""
+    payload = await request.json()
+    user_data = payload.get("data")
+    user_id = user_data.get("id") if user_data else None
+    if not user_id:
+        raise HTTPException(status_code=400, detail="User id not found in payload")
+    
+    # Insert a new record into the 'users' table with a token_count of 10000
+    data = {
+        "user_id": user_id,
+        "token_count": 10000,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    response = supabase.table("users").insert(data).execute()
+    if not response.data:
+        raise HTTPException(status_code=500, detail="Failed to create user record")
+    
+    return {"status": "success", "user_id": user_id}
+
+@app.get("/user/token_count")
+def get_token_count(user_id: str = Depends(get_authenticated_user)):
+    """Returns the user's token count from Supabase."""
+    response = supabase.table("users").select("token_count").eq("user_id", user_id).execute()
+    if not response.data:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"token_count": response.data[0]["token_count"]}
 
 # uvicorn main:app --reload
