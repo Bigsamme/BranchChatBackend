@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException, Depends, Request
+from fastapi import FastAPI, Header, HTTPException, Depends, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import jwt
@@ -101,6 +101,11 @@ def create_message(
     model: str = "gemini-2.0-flash",
     user_id: str = Depends(get_authenticated_user)
 ):
+    # Check if the user has enough tokens
+    user_resp = supabase.table("users").select("token_count").eq("user_id", user_id).single().execute()
+    if user_resp.data["token_count"] <= 0:
+        raise HTTPException(status_code=403, detail="You are out of credits. Please upgrade your plan to continue.")
+
     # 1. Insert the user's message
     user_msg_data = {
         "chat_id": chat_id,
@@ -340,12 +345,151 @@ async def user(request: Request):
     
     return {"status": "success", "user_id": user_id}
 
+import stripe
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")  # add to your .env
+
+@app.post("/create-checkout-session")
+async def create_checkout_session(
+    user_id: str = Depends(get_authenticated_user),
+    body: dict = Body(...)
+):
+    try:
+        plan = body.get("plan")
+        price_lookup = {
+            "starter": "price_1R9ZFeE8gTxt6YIVJCZMAPUK",
+            "pro": "price_1R9ZFzE8gTxt6YIVxHBZFg1Y",
+            "power": "price_1R9ZGCE8gTxt6YIV79ruFhpn"
+        }
+        price_id = price_lookup.get(plan)
+        if not price_id:
+            raise HTTPException(status_code=400, detail="Invalid plan")
+
+        checkout_session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[{"price": price_id, "quantity": 1}],
+            mode="subscription",
+            success_url="http://localhost:3000/success",
+            cancel_url="http://localhost:3000/cancel",
+            client_reference_id=user_id,
+            subscription_data={"metadata": {"user_id": user_id, "plan": plan}}
+        )
+
+        return {"url": checkout_session.url}
+    except Exception as e:
+        print("Stripe error:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/create-portal-session")
+async def create_portal_session(user_id: str = Depends(get_authenticated_user)):
+    try:
+        # Get the user's stored subscription ID
+        user = supabase.table("users").select("subscription_id").eq("user_id", user_id).single().execute()
+        subscription_id = user.data.get("subscription_id")
+
+        if not subscription_id:
+            raise HTTPException(status_code=404, detail="Subscription ID not found")
+
+        # Retrieve the customer ID from the subscription
+        subscription = stripe.Subscription.retrieve(subscription_id)
+        customer_id = subscription.get("customer")
+
+        # Create a portal session
+        session = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url="http://localhost:3000/dashboard"
+        )
+        return {"url": session.url}
+
+    except Exception as e:
+        print("Stripe portal error:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/stripe/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, webhook_secret
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError as e:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    # Handle the checkout.session.completed event
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        user_id = session.get("client_reference_id")
+        subscription_id = session.get("subscription")
+        subscription = stripe.Subscription.retrieve(session.get("subscription"))
+        metadata = subscription.get("metadata", {})
+        plan = metadata.get("plan")
+        print(plan)
+
+        token_grants = {
+            "starter": 100000,
+            "pro": 500000,
+            "power": 5000000
+        }
+        token_count = token_grants.get(plan)
+
+
+        if user_id and subscription_id:
+            supabase.table("users").update({
+                "token_count": token_count or 10000,
+                "subscription_id": subscription_id
+            }).eq("user_id", user_id).execute()
+            supabase.table("users").update({
+                "plan": plan
+            }).eq("user_id", user_id).execute()
+    
+    elif event["type"] == "invoice.payment_succeeded":
+        invoice = event["data"]["object"]
+        subscription_id = invoice.get("subscription")
+
+        if not subscription_id:
+            print("No subscription ID in invoice.payment_succeeded payload. Skipping.")
+            return {"status": "skipped"}
+
+        subscription = stripe.Subscription.retrieve(subscription_id)
+        metadata = subscription.get("metadata", {})
+        user_id = metadata.get("user_id")
+        plan = metadata.get("plan")
+
+        token_grants = {
+            "starter": 100000,
+            "pro": 500000,
+            "power": 5000000
+        }
+        token_count = token_grants.get(plan)
+
+        
+
+        if user_id and token_count:
+            supabase.table("users").update({
+                "token_count": token_count
+            }).eq("user_id", user_id).execute()
+
+
+    return {"status": "success"}
+
+
+
 @app.get("/user/token_count")
 def get_token_count(user_id: str = Depends(get_authenticated_user)):
-    """Returns the user's token count from Supabase."""
-    response = supabase.table("users").select("token_count").eq("user_id", user_id).execute()
+    response = supabase.table("users").select("token_count, plan").eq("user_id", user_id).single().execute()
     if not response.data:
         raise HTTPException(status_code=404, detail="User not found")
-    return {"token_count": response.data[0]["token_count"]}
+    print(response.data["plan"], "hello")
+    print(response.data["token_count"], "hello")
+
+    return {
+        "token_count": response.data["token_count"],
+        "plan": response.data["plan"]
+    }
+
 
 # uvicorn main:app --reload
